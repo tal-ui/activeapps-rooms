@@ -209,13 +209,10 @@ export function NewQuestionModal({ open, onClose, onDone, documentId, blockId }:
     e.preventDefault();
     if (!me) return;
     setBusy(true);
-    const { data, error } = await supabase.from("room_questions").insert({
+    const { error } = await supabase.from("room_questions").insert({
       room_id: home.room.id, document_id: documentId ?? null, block_id: blockId ?? null,
       title: title.trim(), body: body.trim() || null, asked_by_member_id: me.id, owner_member_id: owner || null, due_date: due || null,
-    }).select("id").single();
-    if (!error && data) {
-      await supabase.from("room_events").insert({ room_id: home.room.id, actor_member_id: me.id, type: "question_asked", entity_type: "question", entity_id: data.id, payload: { title: title.trim(), owner_member_id: owner || null, block_id: blockId ?? null, document_id: documentId ?? null }, client_visible: true }).then(() => undefined, () => undefined);
-    }
+    });
     setBusy(false);
     if (error) { toast.push("error", error.message); return; }
     setTitle(""); setBody(""); setDue("");
