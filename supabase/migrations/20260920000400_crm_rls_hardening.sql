@@ -26,6 +26,9 @@
 -- APPLY WITH CARE: run scripts/rls-check.ts afterwards, then Security Advisors.
 -- ============================================================================
 
+-- never wait forever for a lock on a live table
+set lock_timeout = '15s';
+
 create table if not exists public.crm_policy_backup (
   id           bigserial primary key,
   tablename    text not null,
@@ -68,8 +71,10 @@ begin
 
     v_using := case when p.qual is null then null
                     else format('(public.is_internal() and (%s))', p.qual) end;
-    v_check := case when p.with_check is null then null
-                    else format('(public.is_internal() and (%s))', p.with_check) end;
+    -- an UPDATE/ALL policy without WITH CHECK implicitly reuses USING; keep that
+    v_check := case when p.with_check is not null then format('(public.is_internal() and (%s))', p.with_check)
+                    when p.cmd in ('UPDATE','ALL') then v_using
+                    else null end;
 
     execute format('drop policy %I on public.%I', p.policyname, p.tablename);
 
@@ -87,11 +92,101 @@ begin
   end loop;
 end $$;
 
+-- ---------------------------------------------------------------------------
+-- Storage: the CRM buckets (attachments, documents, …) have "TO authenticated
+-- USING (bucket_id = '…')" policies. Wrap them the same way. Rooms' own bucket
+-- policies (room_files_*) are created by the next migration and are skipped.
+-- ---------------------------------------------------------------------------
+do $$
+declare
+  p          record;
+  v_using    text;
+  v_check    text;
+  v_roles    text;
+begin
+  for p in
+    select pol.policyname, pol.cmd, pol.roles, pol.permissive, pol.qual, pol.with_check
+      from pg_policies pol
+     where pol.schemaname = 'storage' and pol.tablename = 'objects'
+       and pol.policyname not like 'room\_files\_%'
+       and (pol.roles::text[] && array['authenticated','public'])
+  loop
+    if coalesce(p.qual, '') ilike '%is_internal()%' or coalesce(p.with_check, '') ilike '%is_internal()%' then
+      continue;
+    end if;
+    insert into public.crm_policy_backup (tablename, policyname, cmd, roles, permissive, qual, with_check)
+    values ('storage.objects', p.policyname, p.cmd, p.roles::text[], p.permissive, p.qual, p.with_check);
+
+    v_roles := array_to_string(array(select quote_ident(r) from unnest(p.roles::text[]) r), ', ');
+    v_using := case when p.qual is null then null else format('(public.is_internal() and (%s))', p.qual) end;
+    v_check := case when p.with_check is not null then format('(public.is_internal() and (%s))', p.with_check)
+                    when p.cmd in ('UPDATE','ALL') then v_using
+                    else null end;
+
+    execute format('drop policy %I on storage.objects', p.policyname);
+    execute format('create policy %I on storage.objects as %s for %s to %s %s %s',
+      p.policyname, p.permissive, p.cmd, v_roles,
+      case when v_using is not null then 'using ' || v_using
+           when p.cmd in ('INSERT') then ''
+           else 'using (public.is_internal())' end,
+      case when v_check is not null then 'with check ' || v_check
+           when p.cmd in ('SELECT','DELETE') then ''
+           else 'with check (public.is_internal())' end);
+  end loop;
+end $$;
+
+-- ---------------------------------------------------------------------------
+-- handle_new_user(): the CRM creates a profiles row for every new auth user.
+-- (Body below = the production function as read on 2026-09-20 via pg_get_functiondef,
+-- plus the two guards; public.epoch_ms() and the profiles columns exist in production.)
+--   * Room clients (app_metadata.kind = 'room_client', or already invited on a
+--     room's client side) get no CRM profile at all.
+--   * A seeded staff profile is linked by e-mail exactly as before.
+--   * Anyone else — which, while public e-mail sign-ups are enabled on the Auth
+--     project, means *any* stranger — now gets an INACTIVE profile. is_internal()
+--     requires is_active, so a self-signed-up user can no longer read the CRM;
+--     an admin activates genuine new staff from Users & Roles. (Also disable
+--     public sign-ups in Auth → Providers → Email.)
+-- ---------------------------------------------------------------------------
+do $$
+begin
+  if exists (select 1 from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+              where n.nspname = 'public' and p.proname = 'handle_new_user') then
+    execute $fn$
+      create or replace function public.handle_new_user()
+      returns trigger
+      language plpgsql
+      security definer
+      set search_path to 'public'
+      as $body$
+      begin
+        if coalesce(new.raw_app_meta_data ->> 'kind', '') = 'room_client' then
+          return new;
+        end if;
+        if exists (select 1 from public.room_members m where m.side = 'client' and lower(m.email) = lower(new.email)) then
+          return new;
+        end if;
+        update public.profiles
+           set auth_user_id = new.id, updated_at = public.epoch_ms()
+         where lower(email) = lower(new.email) and auth_user_id is null;
+        if not found then
+          insert into public.profiles (auth_user_id, email, full_name, role, is_active)
+          values (new.id, new.email,
+                  coalesce(new.raw_user_meta_data->>'full_name', split_part(new.email,'@',1)),
+                  'member', false);
+        end if;
+        return new;
+      end $body$;
+    $fn$;
+  end if;
+end $$;
+
 -- profiles: internal staff need to read the directory; clients must not.
 -- (the loop above already rewrote profiles_read to is_internal() and (true))
 
 -- Lock down the functions the CRM audit flagged as anon-executable (§6 of the
--- CRM builder notes). Safe: Edge Functions call them with the service key.
+-- CRM builder notes). Verified 2026-09-20: the CRM frontend calls none of them
+-- via supabase.rpc(); Edge Functions use the service key.
 do $$
 declare f record;
 begin

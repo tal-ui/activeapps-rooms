@@ -12,6 +12,7 @@
 import { createClient } from "npm:@supabase/supabase-js@2";
 import { corsHeaders, json } from "../_shared/cors.ts";
 import { sendMail } from "../_shared/email.ts";
+import { esc } from "../_shared/strings.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
@@ -25,7 +26,7 @@ const STR = {
     subject: (inviter: string, client: string) => `${inviter} הזמין/ה אותך לחדר של ${client}`,
     heading: (client: string) => `החדר של ${client} ב-ActiveApps`,
     body: (inviter: string, room: string, msg: string | null) =>
-      `<p>${inviter} פתח/ה עבורך חדר עבודה משותף: <strong>${room}</strong>.</p><p>בחדר תמצאו את הצעת העבודה, שאלות פתוחות והחלטות — הכול במקום אחד, בלי סיסמה.</p>${msg ? `<blockquote style="border-inline-start:2px solid #3CC998;margin:16px 0;padding:4px 14px;color:#E3E5E8;">${msg}</blockquote>` : ""}`,
+      `<p>${esc(inviter)} פתח/ה עבורך חדר עבודה משותף: <strong>${esc(room)}</strong>.</p><p>בחדר תמצאו את הצעת העבודה, שאלות פתוחות והחלטות — הכול במקום אחד, בלי סיסמה.</p>${msg ? `<blockquote style="border-inline-start:2px solid #3CC998;margin:16px 0;padding:4px 14px;color:#E3E5E8;">${esc(msg)}</blockquote>` : ""}`,
     cta: "כניסה לחדר",
     footer: "הלינק אישי וחד-פעמי. אפשר תמיד לבקש לינק חדש בכתובת rooms.activeapps.io. אנחנו עונים תוך יום עסקים.",
   },
@@ -33,7 +34,7 @@ const STR = {
     subject: (inviter: string, client: string) => `${inviter} invited you to the ${client} room`,
     heading: (client: string) => `Your ${client} room at ActiveApps`,
     body: (inviter: string, room: string, msg: string | null) =>
-      `<p>${inviter} opened a shared workroom for you: <strong>${room}</strong>.</p><p>Inside you'll find the proposal, open questions and decisions — one place, no password.</p>${msg ? `<blockquote style="border-inline-start:2px solid #3CC998;margin:16px 0;padding:4px 14px;color:#E3E5E8;">${msg}</blockquote>` : ""}`,
+      `<p>${esc(inviter)} opened a shared workroom for you: <strong>${esc(room)}</strong>.</p><p>Inside you'll find the proposal, open questions and decisions — one place, no password.</p>${msg ? `<blockquote style="border-inline-start:2px solid #3CC998;margin:16px 0;padding:4px 14px;color:#E3E5E8;">${esc(msg)}</blockquote>` : ""}`,
     cta: "Open the room",
     footer: "This link is personal and single-use. You can always request a new one at rooms.activeapps.io. We reply within one business day.",
   },
@@ -51,21 +52,28 @@ Deno.serve(async (req: Request) => {
     if (!member_id) return json({ ok: false, error: "member_id required" }, 400);
 
     const { data: member } = await admin.from("room_members").select("*").eq("id", member_id).maybeSingle();
-    if (!member) return json({ ok: false, error: "member not found" }, 404);
+    // permission first: internal writer, or client owner of the same room. Unknown ids get the same answer as forbidden ones.
+    const { data: isInternal } = await caller.rpc("is_internal_writer");
+    const { data: role } = member ? await caller.rpc("room_member_role", { p_room_id: member.room_id }) : { data: null };
+    if (!member || (isInternal !== true && role !== "owner")) return json({ ok: false, error: "forbidden" }, 403);
     if (member.status === "revoked") return json({ ok: false, error: "member revoked" }, 400);
-
-    // permission: internal, or client owner of the same room
-    const { data: isInternal } = await caller.rpc("is_internal");
-    const { data: role } = await caller.rpc("room_member_role", { p_room_id: member.room_id });
-    if (isInternal !== true && role !== "owner") return json({ ok: false, error: "forbidden" }, 403);
+    if (member.side === "client" && isInternal !== true && role === "owner" && member.status !== "invited") {
+      return json({ ok: false, error: "only outstanding invitations can be re-sent" }, 400);
+    }
 
     const { data: room } = await admin.from("rooms").select("*").eq("id", member.room_id).single();
-    const { data: inviterRow } = await admin.from("room_members").select("full_name").eq("room_id", member.room_id).or(`user_id.eq.${userData.user.id},email.eq.${userData.user.email}`).maybeSingle();
-    const inviter = inviterRow?.full_name || "ActiveApps";
+    const { data: byUser } = await admin.from("room_members").select("full_name").eq("room_id", member.room_id).eq("user_id", userData.user.id).maybeSingle();
+    const { data: byMail } = byUser ? { data: null } : await admin.from("room_members").select("full_name").eq("room_id", member.room_id).eq("email", (userData.user.email ?? "").toLowerCase()).maybeSingle();
+    const inviter = byUser?.full_name || byMail?.full_name || "ActiveApps";
     const lang = (room.language === "he" ? "he" : "en") as "he" | "en";
     const s = STR[lang];
     const next = `/r/${room.slug}`;
 
+    // staff invited on the client side of a room would lose CRM access — refuse
+    if (member.side === "client") {
+      const { data: isStaff } = await admin.rpc("is_staff_email", { p_email: member.email });
+      if (isStaff === true) return json({ ok: false, error: "this e-mail belongs to a CRM staff profile; invite them on the ActiveApps side instead" }, 400);
+    }
     // ensure an auth user exists for the invitee (so magic links with shouldCreateUser=false work later)
     const { data: link, error: linkErr } = await admin.auth.admin.generateLink({
       type: "magiclink",
@@ -74,7 +82,9 @@ Deno.serve(async (req: Request) => {
     });
     if (linkErr) {
       // user may not exist yet → create, then generate
-      const { error: createErr } = await admin.auth.admin.createUser({ email: member.email, email_confirm: true, user_metadata: { full_name: member.full_name, room_slug: room.slug } });
+      // app_metadata.kind = 'room_client' is what keeps a client out of is_internal()
+      // and out of the CRM's handle_new_user() profile creation.
+      const { error: createErr } = await admin.auth.admin.createUser({ email: member.email, email_confirm: true, app_metadata: { kind: "room_client" }, user_metadata: { full_name: member.full_name, room_slug: room.slug } });
       if (createErr && !/already/i.test(createErr.message)) return json({ ok: false, error: createErr.message }, 500);
     }
     const { data: link2, error: linkErr2 } = link ? { data: link, error: null } : await admin.auth.admin.generateLink({
@@ -83,9 +93,10 @@ Deno.serve(async (req: Request) => {
     if (linkErr2 || !link2) return json({ ok: false, error: linkErr2?.message ?? "could not generate link" }, 500);
 
     const tokenHash = link2.properties?.hashed_token;
+    // the callback carries the e-mail so an expired token recovers in one tap (login is prefilled)
     const signInUrl = tokenHash
-      ? `${APP_URL}/auth/callback?token_hash=${encodeURIComponent(tokenHash)}&type=magiclink&next=${encodeURIComponent(next)}`
-      : link2.properties?.action_link ?? `${APP_URL}/login?next=${encodeURIComponent(next)}`;
+      ? `${APP_URL}/auth/callback?token_hash=${encodeURIComponent(tokenHash)}&type=magiclink&next=${encodeURIComponent(next)}&email=${encodeURIComponent(member.email)}`
+      : link2.properties?.action_link ?? `${APP_URL}/login?next=${encodeURIComponent(next)}&email=${encodeURIComponent(member.email)}`;
 
     const mail = await sendMail({
       to: member.email,
@@ -99,22 +110,22 @@ Deno.serve(async (req: Request) => {
     });
 
     let channel = "email";
+    let sendError: string | null = null;
     if (mail.skipped) {
-      // no Resend yet: let Supabase send its own invite/magic-link e-mail
-      const { error: otpErr } = await admin.auth.admin.inviteUserByEmail(member.email, { redirectTo: `${APP_URL}/auth/callback?next=${encodeURIComponent(next)}` }).catch(() => ({ error: null }));
-      if (otpErr) {
-        const anonClient = createClient(SUPABASE_URL, ANON_KEY, { auth: { persistSession: false } });
-        await anonClient.auth.signInWithOtp({ email: member.email, options: { emailRedirectTo: `${APP_URL}/auth/callback?next=${encodeURIComponent(next)}`, shouldCreateUser: false } });
-      }
+      // no Resend yet: let Supabase send its own magic-link e-mail (the user now exists)
+      const anonClient = createClient(SUPABASE_URL, ANON_KEY, { auth: { persistSession: false } });
+      const { error: otpErr } = await anonClient.auth.signInWithOtp({ email: member.email, options: { emailRedirectTo: `${APP_URL}/auth/callback?next=${encodeURIComponent(next)}&email=${encodeURIComponent(member.email)}`, shouldCreateUser: false } });
       channel = "supabase_auth_email";
+      sendError = otpErr?.message ?? null;
     } else if (!mail.ok) {
-      return json({ ok: false, error: mail.error }, 502);
+      sendError = mail.error ?? "send failed";
     }
 
     await admin.from("room_notifications").insert({
-      room_id: member.room_id, member_id: member.id, channel: "email", status: "sent", sent_at: new Date().toISOString(),
-      payload: { kind: "invite", provider: channel, message_id: mail.id ?? null, to: member.email },
+      room_id: member.room_id, member_id: member.id, channel: "email", status: sendError ? "failed" : "sent", sent_at: sendError ? null : new Date().toISOString(),
+      payload: { kind: "invite", provider: channel, message_id: mail.id ?? null, error: sendError },
     });
+    if (sendError) return json({ ok: false, error: sendError, channel }, 502);
 
     return json({ ok: true, channel });
   } catch (e) {

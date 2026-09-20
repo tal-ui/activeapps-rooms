@@ -51,6 +51,7 @@ export interface RoomMember {
   invited_by: string | null;
   joined_at: string | null;
   last_seen_at: string | null;
+  previous_seen_at: string | null;
   expires_at: string | null;
   nda_accepted_at: string | null;
   notification_prefs?: Record<string, "immediate" | "digest" | "off">;
@@ -135,6 +136,7 @@ export interface Block {
   approved_by_member_id: string | null;
   approved_at: string | null;
   approved_version: number | null;
+  approved_content_hash: string | null;
   published_version: number | null;
   deleted_at: string | null;
   created_at: string;

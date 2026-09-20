@@ -26,6 +26,11 @@ Deno.serve(async (req: Request) => {
   try {
     const body = (await req.json().catch(() => ({}))) as { force?: boolean };
     if (!body.force && jerusalemHour() !== 8) return json({ ok: true, skipped: `local hour ${jerusalemHour()}` });
+    // replay safety: at most one digest / expiry reminder per member per 20 hours
+    const cutoff = new Date(Date.now() - 20 * 3600 * 1000).toISOString();
+    const { data: recent } = await admin.from("room_notifications").select("member_id, payload").eq("channel", "email").gte("created_at", cutoff).in("payload->>kind", ["digest", "offer_expiry"]);
+    const sentDigest = new Set((recent ?? []).filter((r) => (r.payload as { kind?: string }).kind === "digest").map((r) => r.member_id as string));
+    const sentExpiry = new Set((recent ?? []).filter((r) => (r.payload as { kind?: string }).kind === "offer_expiry").map((r) => r.member_id as string));
 
     const { data: appRow } = await admin.from("room_settings").select("value").eq("key", "app_url").maybeSingle();
     const base = ((appRow?.value as string) || "https://rooms.activeapps.io").replace(/\/$/, "");
@@ -38,13 +43,29 @@ Deno.serve(async (req: Request) => {
       const s = str(lang);
       const roomUrl = `${base}/r/${room.slug}`;
       const [{ data: members }, { data: engagements }, { data: docs }] = await Promise.all([
-        admin.from("room_members").select("id, email, full_name, side, role, status, last_seen_at, notification_prefs, expires_at").eq("room_id", room.id).eq("side", "client").eq("status", "active"),
+        admin.from("room_members").select("id, email, full_name, side, role, status, last_seen_at, previous_seen_at, nda_accepted_at, notification_prefs, expires_at").eq("room_id", room.id).eq("side", "client").eq("status", "active"),
         admin.from("room_engagements").select("id, name, status, offer_valid_until").eq("room_id", room.id).eq("status", "shared"),
-        admin.from("room_documents").select("id, title, confidential, status").eq("room_id", room.id).eq("status", "published"),
+        admin.from("room_documents").select("id, title, confidential, status, current_version").eq("room_id", room.id).eq("status", "published").neq("kind", "file"),
       ]);
-      const docIds = (docs ?? []).map((d) => d.id);
-      const [{ data: pendingBlocks }, { data: openQuestions }, { data: openComments }] = await Promise.all([
-        docIds.length ? admin.from("room_blocks").select("id, document_id, type, content").in("document_id", docIds).in("status", ["in_review", "changed"]).is("deleted_at", null).in("type", ["deliverable", "assumption", "milestone", "pricing_line", "table"]) : Promise.resolve({ data: [] }),
+      // pending approvals come from the PUBLISHED snapshots (never the working copy)
+      const APPROVABLE = new Set(["deliverable", "assumption", "milestone", "pricing_line", "table"]);
+      const pendingAll: { id: string; document_id: string; title: string; confidential: boolean }[] = [];
+      for (const d of docs ?? []) {
+        if (!d.current_version) continue;
+        const { data: v } = await admin.from("room_document_versions").select("snapshot").eq("document_id", d.id).eq("version", d.current_version).maybeSingle();
+        const snap = (v?.snapshot as { id: string; type: string; content: Record<string, string>; content_hash: string }[]) ?? [];
+        const ids = snap.filter((b) => APPROVABLE.has(b.type)).map((b) => b.id);
+        if (!ids.length) continue;
+        const { data: live } = await admin.from("room_blocks").select("id, approved_content_hash").in("id", ids);
+        for (const b of snap) {
+          if (!APPROVABLE.has(b.type)) continue;
+          const row = (live ?? []).find((r) => r.id === b.id);
+          if (row?.approved_content_hash === b.content_hash) continue;
+          pendingAll.push({ id: b.id, document_id: d.id, title: b.content.title || b.content.text || b.content.label || b.content.name || b.type, confidential: !!d.confidential });
+        }
+      }
+      const confidentialDocs = new Set((docs ?? []).filter((d) => d.confidential).map((d) => d.id));
+      const [{ data: openQuestions }, { data: openComments }] = await Promise.all([
         admin.from("room_questions").select("id, title, due_date, owner_member_id, document_id, block_id").eq("room_id", room.id).eq("status", "open"),
         admin.from("room_comments").select("id, mentions, created_at, document_id, block_id, body").eq("room_id", room.id).eq("internal_only", false).is("resolved_at", null).is("deleted_at", null),
       ]);
@@ -52,21 +73,22 @@ Deno.serve(async (req: Request) => {
       for (const m of members ?? []) {
         if (m.expires_at && new Date(m.expires_at) <= new Date()) continue;
         const prefs = (m.notification_prefs ?? {}) as Record<string, string>;
-        if (prefs.digest === "off") continue;
+        if (prefs.digest === "off" || prefs.all === "off") continue;
         const canApprove = m.role === "owner" || m.role === "approver";
-        const myBlocks = canApprove ? (pendingBlocks ?? []) : [];
-        const myQuestions = (openQuestions ?? []).filter((q) => q.owner_member_id === m.id);
-        const since = m.last_seen_at ? new Date(m.last_seen_at).getTime() : 0;
-        const myMentions = (openComments ?? []).filter((c) => (c.mentions as string[]).includes(m.id) && new Date(c.created_at).getTime() > since);
+        const seesDoc = (docId: string | null) => !docId || !confidentialDocs.has(docId) || !!m.nda_accepted_at;
+        const myBlocks = canApprove ? pendingAll.filter((b) => seesDoc(b.document_id)) : [];
+        const myQuestions = (openQuestions ?? []).filter((q) => q.owner_member_id === m.id && seesDoc(q.document_id));
+        const since = m.previous_seen_at ? new Date(m.previous_seen_at).getTime() : 0;
+        const myMentions = (openComments ?? []).filter((c) => (c.mentions as string[]).includes(m.id) && new Date(c.created_at).getTime() > since && seesDoc(c.document_id));
 
         const items: string[] = [];
-        if (myBlocks.length) items.push(`<li><strong>${s.pending_blocks(myBlocks.length)}</strong><ul>${myBlocks.slice(0, 6).map((b) => { const c = b.content as Record<string, string>; return `<li><a href="${roomUrl}/doc/${b.document_id}?block=${b.id}" style="color:#3CC998">${esc(c.title || c.text || c.label || b.type)}</a></li>`; }).join("")}</ul></li>`);
+        if (myBlocks.length) items.push(`<li><strong>${s.pending_blocks(myBlocks.length)}</strong><ul>${myBlocks.slice(0, 6).map((b) => `<li><a href="${roomUrl}/doc/${b.document_id}?block=${b.id}" style="color:#3CC998">${esc(b.title)}</a></li>`).join("")}</ul></li>`);
         if (myQuestions.length) items.push(`<li><strong>${s.owned_questions(myQuestions.length)}</strong><ul>${myQuestions.slice(0, 6).map((q) => `<li><a href="${roomUrl}/questions?q=${q.id}" style="color:#3CC998">${esc(q.title)}</a>${q.due_date ? ` <span style="color:#79818D">(${s.due} ${esc(q.due_date)})</span>` : ""}</li>`).join("")}</ul></li>`);
         if (myMentions.length) items.push(`<li><strong>${s.mentions(myMentions.length)}</strong><ul>${myMentions.slice(0, 4).map((c) => `<li><a href="${roomUrl}/doc/${c.document_id}?block=${c.block_id ?? ""}" style="color:#3CC998">${esc(String(c.body).slice(0, 120))}</a></li>`).join("")}</ul></li>`);
 
         // offer expiry (5 days and 1 day before) — everyone on the client side
         for (const e of engagements ?? []) {
-          if (!e.offer_valid_until) continue;
+          if (!e.offer_valid_until || sentExpiry.has(m.id)) continue;
           const d = daysUntil(e.offer_valid_until);
           if (d === 5 || d === 1) {
             const res = await sendMail({ to: m.email, subject: s.expiry_subject(d, e.name), heading: s.expiry_heading(d), bodyHtml: `<p><strong>${esc(e.name)}</strong> · ${esc(e.offer_valid_until)}</p>`, ctaLabel: s.open, ctaUrl: roomUrl, lang, footer: s.footer });
@@ -75,13 +97,14 @@ Deno.serve(async (req: Request) => {
           }
         }
 
-        if (!items.length) continue;
+        if (!items.length || sentDigest.has(m.id)) continue;
         const res = await sendMail({ to: m.email, subject: s.digest_subject(room.name), heading: s.digest_heading(room.name), bodyHtml: `<ul style="padding-inline-start:18px;">${items.join("")}</ul>`, ctaLabel: s.open, ctaUrl: roomUrl, lang, footer: s.footer });
         await admin.from("room_notifications").insert({ room_id: room.id, member_id: m.id, channel: "email", status: res.ok ? "sent" : "failed", sent_at: res.ok ? new Date().toISOString() : null, payload: { kind: "digest", blocks: myBlocks.length, questions: myQuestions.length, mentions: myMentions.length, error: res.error ?? null, skipped: res.skipped ?? false } });
-        out[`${room.slug}:${m.email}`] = res.ok ? "sent" : res.error;
+        out[room.slug] = ((out[room.slug] as number) ?? 0) + (res.ok ? 1 : 0);
       }
     }
-    return json({ ok: true, out });
+    // counts per room only — never e-mail addresses
+    return json({ ok: true, sent: out });
   } catch (e) {
     return json({ ok: false, error: String(e) }, 500);
   }

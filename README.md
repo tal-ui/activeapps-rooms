@@ -53,6 +53,8 @@ Apply them in order (Supabase MCP `apply_migration`, dashboard SQL editor, or `s
 
 After applying, fill `room_settings`: `functions_url` (`https://<ref>.supabase.co/functions/v1`), `functions_key` (the publishable anon key — functions verify the JWT), `app_url`, and check `crm_stage_on_agreed` / `crm_stage_on_signed` against the CRM's stage list (discovery, qualification, proposal, negotiation, closed_won, closed_lost). Slack uses the CRM's `integrations` row (`key = 'slack'`); add a `channels.rooms` entry or the default channel is used.
 
+**Review before apply (2026-09-20):** a five-lens adversarial review of the migrations, RPCs and functions produced 68 findings; all distinct ones were reproduced or refuted in the harness and fixed (approval-by-hash, expiry in `current_member_id`, read-only staff split, client column guards, invite rework, hardening loop corrections, escaping and recipient filtering in the functions). Details in `docs/decisions.md`.
+
 Then: `npm run rls:check` with a test client user, Supabase **Security Advisors**, and Auth settings:
 redirect URL allow-list (`https://rooms.activeapps.io/auth/callback`, `http://localhost:5174/auth/callback`),
 OTP expiry 900s, rate limits on, leaked-password protection on.
@@ -62,10 +64,23 @@ Edge Functions: `supabase functions deploy room-invite room-notify room-digest` 
 (recorded in `room_notifications` with `skipped: true`) and invitations fall back to Supabase Auth e-mails.
 Manual digest test: `POST /functions/v1/room-digest` with `{"force": true}`.
 
+## Go-live status (2026-09-20)
+
+| Step | State |
+|---|---|
+| Vercel project `activeapps-rooms` (team Tal's projects) | **live** at https://activeapps-rooms.vercel.app — env: `VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY` (publishable), `VITE_CRM_URL`; the app uses its own origin for links |
+| Custom domain `rooms.activeapps.io` | **manual** — `activeapps.io` DNS is not on Vercel: `vercel domains add rooms.activeapps.io activeapps-rooms --scope tals-projects-ab7d6a47`, then a CNAME `rooms → cname.vercel-dns.com` at the DNS provider; afterwards set `room_settings.app_url` and Auth redirect URLs to the custom domain |
+| Supabase migrations | applied 2026-09-20 after the adversarial review below; `room_settings` filled; Security Advisors run — see "Apply to Supabase" |
+| Edge Functions `room-invite`, `room-notify`, `room-digest` | deployed via MCP (`verify_jwt = true`); `RESEND_API_KEY`, `ROOMS_EMAIL_FROM`, `ROOMS_EMAIL_REPLY_TO`, `ROOMS_APP_URL` secrets: **manual** (Dashboard → Edge Functions → Secrets) |
+| Auth settings | **manual** (Dashboard → Authentication): Site URL = app URL; Redirect URLs = `https://activeapps-rooms.vercel.app/auth/callback`, `https://rooms.activeapps.io/auth/callback`, `http://localhost:5174/auth/callback`; Email OTP expiry 900 s; **disable "Allow new users to sign up"** (public sign-ups are currently ON and `handle_new_user()` creates a profile for every sign-up — the hardening makes such profiles inactive, but closing the door is better); enable leaked-password protection; keep rate limits on |
+| GitHub `tal-ui/activeapps-rooms` | **manual** — no `gh` CLI / GitHub auth on this machine: create the repo, `git remote add origin …`, `git push -u origin main`, then connect it to the Vercel project for git deploys |
+
 ## Decisions recorded
 
 - **Timestamps are `timestamptz`** in all `room_*` tables (spec §11.4). The CRM uses bigint-ms; the two never sort across each other. FKs into the CRM (`accounts`, `opportunities`, `projects`) keep the CRM's `character varying` ids.
 - **Clients never read `room_blocks` directly.** The working copy is staff-only; clients read published snapshots (`room_document_versions`) through `room_document_view()`, which merges live approval status and counters. Unpublished edits are invisible even via the REST API.
+- **`is_internal()` is three-way**: active staff profile **and** JWT `app_metadata.kind ≠ room_client` **and** not a client-side member of any room (by user id or e-mail). The CRM's `handle_new_user()` trigger creates a profile for every new auth user, so a profile alone can never mean staff; unknown sign-ups now get `is_active = false`.
+- **`room-notify` / `room-digest` are replay-safe instead of secret-protected**: the event is re-read from the database by id and processed at most once (`room_notifications.event_id`); the digest sends at most once per member per 20 h. A forged call to either function cannot send anything new.
 - **Every client-triggered transition is an RPC** (`room_approve_block`, `room_approve_sow`, `room_select_pricing_option`, `room_accept_nda`, `room_answer_question`, `room_invite_member`) with its own permission check. Direct table writes for clients are limited to comments, questions, view events, block views, and their own member row (column-guarded by trigger).
 - **Events are emitted by triggers/RPCs**, never trusted from the client, so `room-notify` (sprint 4) sees the same stream whatever client wrote the row.
 - **Magic links use the implicit flow + `token_hash` verification** so a link requested on a laptop opens on a phone.

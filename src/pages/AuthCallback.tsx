@@ -18,6 +18,7 @@ export default function AuthCallback() {
   const lang = (navigator.language || "").startsWith("he") ? "he" : "en";
   const t = (k: Parameters<typeof translate>[1]) => translate(lang, k);
   const next = params.get("next") || "/";
+  const email = params.get("email") || "";
 
   useEffect(() => {
     let done = false;
@@ -61,7 +62,7 @@ export default function AuthCallback() {
       {failed ? (
         <>
           <ErrorBox message={t("auth_failed")} />
-          <a className="btn btn-primary" href={`/login?next=${encodeURIComponent(next)}`}>{t("login_send_link")}</a>
+          <a className="btn btn-primary" href={`/login?next=${encodeURIComponent(next)}${email ? `&email=${encodeURIComponent(email)}` : ""}`}>{t("login_send_link")}</a>
         </>
       ) : (
         <>

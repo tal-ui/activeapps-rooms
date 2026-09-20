@@ -21,10 +21,15 @@ export function channelFor(cfg: SlackConfig, kind: string): string {
   return cfg.channels?.[kind] || cfg.default_channel || cfg.channel || "";
 }
 
+/** Escape client-written text for Slack mrkdwn (prevents <!channel>, <url|label> and formatting injection). */
+export function mrkdwn(s: unknown): string {
+  return String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").slice(0, 600);
+}
+
 export function blocksFor(header: string, fields: [string, string][], url: string, buttonText = "Open room") {
   return [
-    { type: "header", text: { type: "plain_text", text: header, emoji: true } },
-    { type: "section", fields: fields.map(([k, v]) => ({ type: "mrkdwn", text: `*${k}*\n${v}` })) },
+    { type: "header", text: { type: "plain_text", text: header.slice(0, 150), emoji: true } },
+    { type: "section", fields: fields.map(([k, v]) => ({ type: "mrkdwn", text: `*${mrkdwn(k)}*\n${mrkdwn(v)}` })) },
     { type: "actions", elements: [{ type: "button", text: { type: "plain_text", text: buttonText }, url, style: "primary" }] },
   ];
 }

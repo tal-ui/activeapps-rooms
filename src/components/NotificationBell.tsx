@@ -25,7 +25,7 @@ export default function NotificationBell() {
 
   const load = useCallback(async () => {
     if (!memberId) return;
-    const { data } = await supabase.from("room_notifications").select("id, status, created_at, payload").eq("room_id", home.room.id).eq("member_id", memberId).eq("channel", "in_app").order("created_at", { ascending: false }).limit(30);
+    const { data } = await supabase.from("room_notifications").select("id, status, created_at, payload").eq("room_id", home.room.id).eq("member_id", memberId).eq("channel", "in_app").neq("payload->>kind", "processed_marker").order("created_at", { ascending: false }).limit(30);
     setItems((data as Notif[]) ?? []);
   }, [home.room.id, memberId]);
 

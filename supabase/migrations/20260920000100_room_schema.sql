@@ -74,6 +74,7 @@ create table if not exists public.room_members (
   invited_by          uuid references public.room_members(id) on delete set null,
   joined_at           timestamptz,
   last_seen_at        timestamptz,
+  previous_seen_at    timestamptz,     -- start of the previous visit; "what changed" is computed against this
   expires_at          timestamptz,
   nda_accepted_at     timestamptz,
   notification_prefs  jsonb not null default '{}'::jsonb,
@@ -164,6 +165,7 @@ create table if not exists public.room_blocks (
   approved_by_member_id uuid references public.room_members(id) on delete set null,
   approved_at          timestamptz,
   approved_version     integer,
+  approved_content_hash text,          -- hash of the published content the approver actually saw
   published_version    integer,          -- first version this block appeared in
   deleted_at           timestamptz,
   created_at           timestamptz not null default now(),
@@ -398,6 +400,8 @@ begin
   update public.rooms set phase = v_phase where id = p_room_id and phase not in ('closed') and phase is distinct from v_phase;
 end;
 $$;
+-- only the engagement trigger (SECURITY DEFINER, runs as owner) calls this
+revoke execute on function public.room_recompute_phase(uuid) from public, anon, authenticated;
 
 create or replace function public.room_engagement_status_changed()
 returns trigger
@@ -447,7 +451,10 @@ $$;
 revoke execute on function public.room_claim_membership() from public, anon;
 grant execute on function public.room_claim_membership() to authenticated;
 
--- Touch last_seen_at for the current member of a room (cheap, called on visit)
+-- Visit bookkeeping. A visit that starts more than 30 minutes after the last
+-- touch is a new visit: previous_seen_at moves to the old last_seen_at, so
+-- "new since your last visit" stays stable for the whole session instead of
+-- collapsing to "now" on the first page load.
 create or replace function public.room_touch_last_seen(p_room_id uuid)
 returns timestamptz
 language plpgsql
@@ -455,13 +462,19 @@ security definer
 set search_path = public, pg_temp
 as $$
 declare
-  v_prev timestamptz;
+  v_last   timestamptz;
+  v_prev   timestamptz;
   v_member uuid := public.current_member_id(p_room_id);
 begin
   if v_member is null then return null; end if;
-  select last_seen_at into v_prev from public.room_members where id = v_member;
+  select last_seen_at, previous_seen_at into v_last, v_prev from public.room_members where id = v_member;
   perform set_config('room.bypass_member_guard', 'on', true);
-  update public.room_members set last_seen_at = now() where id = v_member;
+  if v_last is null or v_last < now() - interval '30 minutes' then
+    update public.room_members set previous_seen_at = v_last, last_seen_at = now() where id = v_member;
+    v_prev := v_last;
+  else
+    update public.room_members set last_seen_at = now() where id = v_member;
+  end if;
   perform set_config('room.bypass_member_guard', '', true);
   return v_prev;
 end;

@@ -15,6 +15,8 @@ export interface Mail {
   footer?: string;
 }
 
+const esc = (s: unknown) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c] as string));
+
 export function layout(m: Mail): string {
   const dir = m.lang === "he" ? "rtl" : "ltr";
   const font = m.lang === "he" ? "Heebo, Arial, sans-serif" : "Inter, Arial, sans-serif";
@@ -26,12 +28,12 @@ export function layout(m: Mail): string {
           <span style="color:#BABEC4">ACTIVE</span><span style="color:#3CC998">APPS</span>
           <span style="display:block;font-family:'JetBrains Mono',monospace;font-size:10px;letter-spacing:0.15em;color:#5E6268;text-transform:uppercase;margin-top:2px;">Tech Orchestration</span>
         </td></tr>
-        <tr><td style="padding:20px 28px 0;"><h1 style="margin:0;font-size:20px;line-height:1.3;color:#E3E5E8;">${m.heading}</h1></td></tr>
+        <tr><td style="padding:20px 28px 0;"><h1 style="margin:0;font-size:20px;line-height:1.3;color:#E3E5E8;">${esc(m.heading)}</h1></td></tr>
         <tr><td style="padding:14px 28px 0;font-size:15px;line-height:1.65;color:#BABEC4;">${m.bodyHtml}</td></tr>
         <tr><td style="padding:24px 28px 28px;">
-          <a href="${m.ctaUrl}" style="display:inline-block;background:#3CC998;color:#06090F;font-weight:600;text-decoration:none;padding:12px 20px;border-radius:6px;font-size:14px;">${m.ctaLabel}</a>
+          <a href="${esc(m.ctaUrl)}" style="display:inline-block;background:#3CC998;color:#06090F;font-weight:600;text-decoration:none;padding:12px 20px;border-radius:6px;font-size:14px;">${esc(m.ctaLabel)}</a>
         </td></tr>
-        <tr><td style="padding:0 28px 24px;font-size:12px;color:#6E7278;line-height:1.5;">${m.footer ?? ""}</td></tr>
+        <tr><td style="padding:0 28px 24px;font-size:12px;color:#6E7278;line-height:1.5;">${esc(m.footer ?? "")}</td></tr>
       </table>
       <p style="font-size:11px;color:#3F4348;margin:16px 0 0;">ActiveApps · rooms.activeapps.io</p>
     </td></tr>

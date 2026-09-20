@@ -87,7 +87,7 @@ begin
   end if;
 
   v_member := public.current_member_id(v_doc.room_id);
-  select last_seen_at into v_last_seen from public.room_members where id = v_member;
+  select previous_seen_at into v_last_seen from public.room_members where id = v_member;
 
   v_version := coalesce(p_version, v_doc.current_version);
 
@@ -125,8 +125,9 @@ begin
       s || jsonb_build_object(
         'live_status', coalesce(b.status, s->>'status'),
         'display_status', case
-            when b.status = 'agreed' then 'agreed'
-            else coalesce(s->>'status', b.status, 'in_review') end,
+            when b.approved_content_hash is not null and b.approved_content_hash = s->>'content_hash' then 'agreed'
+            when b.approved_content_hash is not null then 'changed'
+            else coalesce(nullif(s->>'status', 'agreed'), 'in_review') end,
         'approved_at', b.approved_at,
         'approved_by_member_id', b.approved_by_member_id,
         'approved_version', b.approved_version,
@@ -246,10 +247,12 @@ begin
      set current_version = v_next, status = 'published'
    where id = p_document_id;
 
-  -- shared engagement once its SOW is out
-  update public.room_engagements
-     set status = 'shared'
-   where id = v_doc.engagement_id and status = 'draft';
+  -- shared engagement once its SOW / offer is out (not for NDA, plan, …)
+  if v_doc.kind in ('sow','offer') then
+    update public.room_engagements
+       set status = 'shared'
+     where id = v_doc.engagement_id and status = 'draft';
+  end if;
 
   perform public.room_emit_event(v_doc.room_id, 'version_published', 'document', p_document_id,
     jsonb_build_object('version', v_next, 'change_summary', v_summary,
@@ -278,8 +281,10 @@ declare
   v_doc    public.room_documents%rowtype;
   v_member uuid;
   v_role   text;
+  v_snapshot_hash text;
+  v_new_status text;
 begin
-  select * into v_block from public.room_blocks where id = p_block_id for update;
+  select * into v_block from public.room_blocks where id = p_block_id and deleted_at is null for update;
   if v_block.id is null then raise exception 'block not found' using errcode = 'P0002'; end if;
   select * into v_doc from public.room_documents where id = v_block.document_id;
 
@@ -291,23 +296,34 @@ begin
   if not public.room_document_visible(v_block.document_id) then
     raise exception 'not allowed' using errcode = '42501';
   end if;
-  if v_block.status = 'draft' then
-    raise exception 'block is not published yet' using errcode = '22023';
+  if not public.room_block_is_approvable(v_block.type) then
+    raise exception 'this block type is not approvable' using errcode = '22023';
+  end if;
+  -- the approver approves what was published: take the hash from the current snapshot
+  select s->>'content_hash' into v_snapshot_hash
+    from public.room_document_versions v, jsonb_array_elements(v.snapshot) s
+   where v.document_id = v_doc.id and v.version = v_doc.current_version and s->>'id' = p_block_id::text;
+  if v_snapshot_hash is null then
+    raise exception 'block is not part of the published version' using errcode = '22023';
   end if;
 
   update public.room_blocks
-     set status = 'agreed',
+     set status = case when content_hash = v_snapshot_hash then 'agreed' else 'changed' end,
          approved_by_member_id = v_member,
          approved_at = now(),
-         approved_version = v_doc.current_version
-   where id = p_block_id;
+         approved_version = v_doc.current_version,
+         approved_content_hash = v_snapshot_hash
+   where id = p_block_id
+   returning status into v_new_status;
 
   perform public.room_emit_event(v_block.room_id, 'block_approved', 'block', p_block_id,
     jsonb_build_object('document_id', v_block.document_id, 'version', v_doc.current_version,
                        'block_type', v_block.type, 'title', coalesce(v_block.content->>'title', v_block.content->>'text', v_block.content->>'label')),
     true, v_member);
 
-  return jsonb_build_object('ok', true, 'status', 'agreed', 'approved_at', now(), 'version', v_doc.current_version);
+  -- 'changed' here means: the published content is approved, but the working
+  -- copy already differs — the next publish will ask for re-approval.
+  return jsonb_build_object('ok', true, 'status', v_new_status, 'approved_at', now(), 'version', v_doc.current_version);
 end;
 $$;
 revoke execute on function public.room_approve_block(uuid) from public, anon;
@@ -318,29 +334,46 @@ grant execute on function public.room_approve_block(uuid) to authenticated, serv
 -- ---------------------------------------------------------------------------
 create or replace function public.room_sow_readiness(p_engagement_id uuid)
 returns jsonb
-language sql
+language plpgsql
 stable
 security definer
 set search_path = public, pg_temp
 as $$
-  with sow as (
-    select d.* from public.room_documents d
-     where d.engagement_id = p_engagement_id and d.kind = 'sow' and d.status = 'published'
-     order by d.created_at limit 1
-  ),
-  blocks as (
-    select b.* from public.room_blocks b join sow on sow.id = b.document_id
-     where b.deleted_at is null and b.status <> 'draft' and public.room_block_is_approvable(b.type)
-  )
-  select jsonb_build_object(
-    'sow_document_id', (select id from sow),
-    'version', (select current_version from sow),
-    'total', (select count(*) from blocks),
-    'agreed', (select count(*) from blocks where status = 'agreed'),
-    'pending', (select count(*) from blocks where status <> 'agreed'),
-    'ready', (select count(*) from blocks) > 0 and (select count(*) from blocks where status <> 'agreed') = 0,
-    'pending_block_ids', (select coalesce(jsonb_agg(id), '[]'::jsonb) from blocks where status <> 'agreed')
+declare
+  v_room uuid;
+begin
+  select room_id into v_room from public.room_engagements where id = p_engagement_id;
+  if v_room is null then return null; end if;
+  if not public.is_internal() and not public.is_room_member(v_room) then
+    raise exception 'not allowed' using errcode = '42501';
+  end if;
+  return (
+    with sow as (
+      select d.* from public.room_documents d
+       where d.engagement_id = p_engagement_id and d.kind = 'sow' and d.status = 'published'
+       order by d.created_at limit 1
+    ),
+    snap as (
+      select (s->>'id')::uuid as id, s->>'type' as type, s->>'content_hash' as content_hash
+        from public.room_document_versions v join sow on sow.id = v.document_id and v.version = sow.current_version,
+             jsonb_array_elements(v.snapshot) s
+    ),
+    blocks as (
+      select snap.id, (b.approved_content_hash is not null and b.approved_content_hash = snap.content_hash) as agreed
+        from snap join public.room_blocks b on b.id = snap.id
+       where public.room_block_is_approvable(snap.type)
+    )
+    select jsonb_build_object(
+      'sow_document_id', (select id from sow),
+      'version', (select current_version from sow),
+      'total', (select count(*) from blocks),
+      'agreed', (select count(*) from blocks where agreed),
+      'pending', (select count(*) from blocks where not agreed),
+      'ready', (select count(*) from blocks) > 0 and (select count(*) from blocks where not agreed) = 0,
+      'pending_block_ids', (select coalesce(jsonb_agg(id), '[]'::jsonb) from blocks where not agreed)
+    )
   );
+end;
 $$;
 revoke execute on function public.room_sow_readiness(uuid) from public, anon;
 grant execute on function public.room_sow_readiness(uuid) to authenticated, service_role;
@@ -372,6 +405,10 @@ begin
     raise exception 'engagement is not awaiting approval (status %)', v_eng.status using errcode = '22023';
   end if;
 
+  if v_eng.offer_valid_until is not null and v_eng.offer_valid_until < current_date then
+    raise exception 'the offer expired on %', v_eng.offer_valid_until using errcode = '22023';
+  end if;
+
   v_ready := public.room_sow_readiness(p_engagement_id);
   if not (v_ready->>'ready')::boolean then
     raise exception '% block(s) still need approval', v_ready->>'pending' using errcode = '22023';
@@ -380,6 +417,15 @@ begin
   select * into v_version from public.room_document_versions
    where document_id = (v_ready->>'sow_document_id')::uuid
      and version = (v_ready->>'version')::int;
+
+  -- when the published SOW offers pricing options, one must be chosen (and be in the snapshot)
+  if exists (select 1 from jsonb_array_elements(v_version.snapshot) s where s->>'type' = 'pricing_option') then
+    if v_eng.selected_pricing_option_block_id is null
+       or not exists (select 1 from jsonb_array_elements(v_version.snapshot) s
+                       where s->>'id' = v_eng.selected_pricing_option_block_id::text) then
+      raise exception 'choose a pricing option before approving the SOW' using errcode = '22023';
+    end if;
+  end if;
 
   v_record := jsonb_build_object(
     'member_id', v_member.id,
@@ -447,13 +493,15 @@ begin
   if v_block.status = 'draft' and not public.is_internal() then
     raise exception 'option is not published yet' using errcode = '22023';
   end if;
+  if not public.is_internal() and not public.room_document_visible(v_block.document_id) then
+    raise exception 'not allowed' using errcode = '42501';
+  end if;
 
   update public.room_engagements set selected_pricing_option_block_id = p_block_id where id = p_engagement_id;
 
   perform public.room_emit_event(v_eng.room_id, 'pricing_option_selected', 'block', p_block_id,
     jsonb_build_object('engagement_id', p_engagement_id, 'engagement_name', v_eng.name,
-                       'option_name', v_block.content->>'name', 'price', v_block.content->'price',
-                       'currency', v_block.content->>'currency'),
+                       'option_name', v_block.content->>'name', 'document_id', v_block.document_id),
     true, v_member);
   return jsonb_build_object('ok', true, 'selected_pricing_option_block_id', p_block_id);
 end;
@@ -470,11 +518,17 @@ language plpgsql
 security definer
 set search_path = public, pg_temp
 as $$
-declare v_member uuid := public.current_member_id(p_room_id);
+declare
+  v_member uuid := public.current_member_id(p_room_id);
+  v_already timestamptz;
 begin
   if v_member is null then raise exception 'not a member' using errcode = '42501'; end if;
+  select nda_accepted_at into v_already from public.room_members where id = v_member;
+  if v_already is not null then
+    return jsonb_build_object('ok', true, 'nda_accepted_at', v_already, 'already', true);
+  end if;
   perform set_config('room.bypass_member_guard', 'on', true);
-  update public.room_members set nda_accepted_at = coalesce(nda_accepted_at, now()) where id = v_member;
+  update public.room_members set nda_accepted_at = now() where id = v_member;
   perform set_config('room.bypass_member_guard', '', true);
   perform public.room_emit_event(p_room_id, 'nda_accepted', 'member', v_member, '{}'::jsonb, true, v_member);
   return jsonb_build_object('ok', true, 'nda_accepted_at', now());
@@ -500,8 +554,12 @@ begin
   select * into v_q from public.room_questions where id = p_question_id for update;
   if v_q.id is null then raise exception 'question not found' using errcode = 'P0002'; end if;
   v_member := public.current_member_id(v_q.room_id);
-  if not public.is_internal() and (v_member is null or v_member <> v_q.owner_member_id) then
-    raise exception 'only the owner of the question can answer it' using errcode = '42501';
+  if not public.is_internal()
+     and (v_member is null or v_q.owner_member_id is null or v_member <> v_q.owner_member_id) then
+    raise exception 'only the owner of the question (or ActiveApps) can answer it' using errcode = '42501';
+  end if;
+  if v_q.status <> 'open' then
+    raise exception 'question is already answered' using errcode = '22023';
   end if;
   if nullif(trim(p_answer), '') is null then
     raise exception 'answer is required' using errcode = '22023';
@@ -537,12 +595,15 @@ security definer
 set search_path = public, pg_temp
 as $$
 declare
-  v_inviter uuid := public.current_member_id(p_room_id);
-  v_role    text := public.room_member_role(p_room_id);
-  v_row     public.room_members%rowtype;
+  v_inviter  uuid := public.current_member_id(p_room_id);
+  v_role     text := public.room_member_role(p_room_id);
+  v_row      public.room_members%rowtype;
+  v_existing public.room_members%rowtype;
 begin
   if public.is_internal() then
-    null;
+    if not public.is_internal_writer() then
+      raise exception 'read-only staff cannot invite' using errcode = '42501';
+    end if;
   elsif v_role = 'owner' then
     if p_side <> 'client' or p_role not in ('approver','commenter','viewer') then
       raise exception 'a client owner can invite approvers, commenters or viewers on the client side' using errcode = '42501';
@@ -553,14 +614,46 @@ begin
   if p_email !~ '^[^@\s]+@[^@\s]+\.[^@\s]+$' then
     raise exception 'invalid e-mail' using errcode = '22023';
   end if;
+  -- A staff e-mail on the client side would strip that person of is_internal()
+  -- (and thereby of all CRM access). Refuse for every caller; the trigger
+  -- room_members_guard_staff_email enforces the same rule on any write path.
+  if p_side = 'client' and public.is_staff_email(p_email) then
+    raise exception 'this e-mail belongs to an ActiveApps staff profile; invite them on the ActiveApps side' using errcode = '42501';
+  end if;
+
+  select * into v_existing from public.room_members
+   where room_id = p_room_id and lower(email) = lower(trim(p_email));
+
+  if v_existing.id is not null then
+    if not public.is_internal() then
+      -- a client owner may only re-send an outstanding client invitation
+      if v_existing.side = 'client' and v_existing.status = 'invited' then
+        return v_existing;
+      end if;
+      raise exception 'this person is already a member of the room' using errcode = '23505';
+    end if;
+    -- staff: update role / details, reinstate if revoked
+    perform set_config('room.bypass_member_guard', 'on', true);
+    update public.room_members
+       set status = case when status = 'revoked' then 'invited' else status end,
+           side = p_side, role = p_role,
+           full_name = coalesce(nullif(p_full_name, ''), full_name),
+           title = coalesce(p_title, title),
+           expires_at = p_expires_at
+     where id = v_existing.id
+     returning * into v_row;
+    perform set_config('room.bypass_member_guard', '', true);
+    if v_existing.status = 'revoked' then
+      perform public.room_emit_event(p_room_id, 'member_invited', 'member', v_row.id,
+        jsonb_build_object('email', v_row.email, 'full_name', v_row.full_name, 'role', v_row.role, 'side', v_row.side, 'reinstated', true),
+        true, v_inviter);
+    end if;
+    return v_row;
+  end if;
 
   perform set_config('room.bypass_member_guard', 'on', true);
   insert into public.room_members (room_id, email, full_name, title, side, role, status, invited_by, expires_at)
   values (p_room_id, lower(trim(p_email)), coalesce(p_full_name, ''), p_title, p_side, p_role, 'invited', v_inviter, p_expires_at)
-  on conflict (room_id, lower(email)) do update
-    set status = case when public.room_members.status = 'revoked' then 'invited' else public.room_members.status end,
-        full_name = coalesce(nullif(excluded.full_name, ''), public.room_members.full_name),
-        title = coalesce(excluded.title, public.room_members.title)
   returning * into v_row;
   perform set_config('room.bypass_member_guard', '', true);
 
@@ -572,6 +665,32 @@ end;
 $$;
 revoke execute on function public.room_invite_member(uuid, text, text, text, text, text, timestamptz) from public, anon;
 grant execute on function public.room_invite_member(uuid, text, text, text, text, text, timestamptz) to authenticated, service_role;
+
+-- ---------------------------------------------------------------------------
+-- room_published_blocks — blocks as the client sees them: from the current
+-- published snapshot of each visible document (confidential ⇒ NDA), with the
+-- live approval state resolved against the snapshot hash.
+-- ---------------------------------------------------------------------------
+create or replace function public.room_published_blocks(p_room_id uuid)
+returns table (id uuid, document_id uuid, type text, content jsonb, sort_order int, status text, content_hash text, agreed boolean, title text)
+language sql
+stable
+security definer
+set search_path = public, pg_temp
+as $$
+  select (s->>'id')::uuid, d.id, s->>'type', s->'content', (s->>'sort_order')::int, s->>'status', s->>'content_hash',
+         (b.approved_content_hash is not null and b.approved_content_hash = s->>'content_hash'),
+         coalesce(s->'content'->>'title', s->'content'->>'label', s->'content'->>'name', s->'content'->>'text')
+    from public.room_documents d
+    join public.room_document_versions v on v.document_id = d.id and v.version = d.current_version,
+         jsonb_array_elements(v.snapshot) s
+    left join public.room_blocks b on b.id = (s->>'id')::uuid
+   where d.room_id = p_room_id and d.status = 'published' and d.kind <> 'file'
+     and (public.is_internal() or public.is_room_member(p_room_id))
+     and (not d.confidential or public.is_internal() or public.has_accepted_nda(p_room_id));
+$$;
+revoke execute on function public.room_published_blocks(uuid) from public, anon;
+grant execute on function public.room_published_blocks(uuid) to authenticated, service_role;
 
 -- ---------------------------------------------------------------------------
 -- room_home — one round-trip for the room home page
@@ -615,20 +734,17 @@ begin
     'my_questions', (select coalesce(jsonb_agg(jsonb_build_object('id', q.id, 'title', q.title, 'due_date', q.due_date, 'block_id', q.block_id, 'document_id', q.document_id) order by q.due_date nulls last, q.created_at), '[]'::jsonb)
                        from public.room_questions q where q.room_id = v_room.id and q.status = 'open' and q.owner_member_id = v_member.id),
     'my_pending_blocks', case when v_member.role in ('owner','approver') then (
-        select coalesce(jsonb_agg(jsonb_build_object('id', b.id, 'document_id', b.document_id, 'type', b.type,
-                 'title', coalesce(b.content->>'title', b.content->>'label', b.content->>'text')) order by b.sort_order), '[]'::jsonb)
-          from public.room_blocks b join public.room_documents d on d.id = b.document_id
-         where d.room_id = v_room.id and d.status = 'published' and b.deleted_at is null
-           and b.status in ('in_review','changed') and public.room_block_is_approvable(b.type)
-           and (not d.confidential or public.has_accepted_nda(v_room.id))) else '[]'::jsonb end,
+        select coalesce(jsonb_agg(jsonb_build_object('id', pb.id, 'document_id', pb.document_id, 'type', pb.type, 'title', pb.title) order by pb.sort_order), '[]'::jsonb)
+          from public.room_published_blocks(v_room.id) pb
+         where public.room_block_is_approvable(pb.type) and not pb.agreed) else '[]'::jsonb end,
     'my_mentions', (select coalesce(jsonb_agg(jsonb_build_object('id', c.id, 'block_id', c.block_id, 'document_id', c.document_id, 'body', left(c.body, 140), 'created_at', c.created_at) order by c.created_at desc), '[]'::jsonb)
                       from public.room_comments c where c.room_id = v_room.id and c.deleted_at is null and c.resolved_at is null
                        and v_member.id = any(c.mentions) and (v_internal or c.internal_only = false)
-                       and (v_member.last_seen_at is null or c.created_at > v_member.last_seen_at)),
-    'changes_since_visit', case when v_member.last_seen_at is null then '[]'::jsonb else (
+                       and (v_member.previous_seen_at is null or c.created_at > v_member.previous_seen_at)),
+    'changes_since_visit', case when v_member.previous_seen_at is null then '[]'::jsonb else (
         select coalesce(jsonb_agg(jsonb_build_object('id', e.id, 'type', e.type, 'entity_type', e.entity_type, 'entity_id', e.entity_id, 'payload', e.payload, 'created_at', e.created_at, 'actor_member_id', e.actor_member_id) order by e.created_at desc), '[]'::jsonb)
-          from public.room_events e where e.room_id = v_room.id and e.created_at > v_member.last_seen_at
-           and e.client_visible and e.type in ('version_published','question_answered','comment_added','block_approved','sow_approved','decision_recorded')
+          from public.room_events e where e.room_id = v_room.id and e.created_at > v_member.previous_seen_at
+           and e.client_visible and e.type in ('version_published','question_answered','comment_added','block_approved','sow_approved')
            and (e.actor_member_id is distinct from v_member.id)) end,
     'engagements', (select coalesce(jsonb_agg(to_jsonb(e) order by e.sort_order, e.created_at), '[]'::jsonb)
                       from public.room_engagements e where e.room_id = v_room.id and (v_internal or e.status <> 'draft')),
@@ -640,9 +756,8 @@ begin
     'members', (select coalesce(jsonb_agg(jsonb_build_object('id', m.id, 'full_name', m.full_name, 'title', m.title, 'email', m.email,
                   'side', m.side, 'role', m.role, 'status', m.status, 'last_seen_at', m.last_seen_at, 'nda_accepted_at', m.nda_accepted_at) order by m.side, m.created_at), '[]'::jsonb)
                   from public.room_members m where m.room_id = v_room.id and m.status <> 'revoked'),
-    'milestones', (select coalesce(jsonb_agg(jsonb_build_object('id', b.id, 'document_id', b.document_id, 'content', b.content, 'status', b.status) order by (b.content->>'target_date') nulls last), '[]'::jsonb)
-                     from public.room_blocks b join public.room_documents d on d.id = b.document_id
-                    where d.room_id = v_room.id and b.type = 'milestone' and b.deleted_at is null and b.status <> 'draft' and d.status = 'published'),
+    'milestones', (select coalesce(jsonb_agg(jsonb_build_object('id', pb.id, 'document_id', pb.document_id, 'content', pb.content, 'status', case when pb.agreed then 'agreed' else pb.status end) order by (pb.content->>'target_date') nulls last), '[]'::jsonb)
+                     from public.room_published_blocks(v_room.id) pb where pb.type = 'milestone'),
     'recent_events', (select coalesce(jsonb_agg(jsonb_build_object('id', e.id, 'type', e.type, 'entity_type', e.entity_type, 'entity_id', e.entity_id, 'payload', e.payload, 'created_at', e.created_at, 'actor_member_id', e.actor_member_id) order by e.created_at desc), '[]'::jsonb)
                         from (select * from public.room_events e where e.room_id = v_room.id and (v_internal or e.client_visible)
                                and e.type not in ('room_viewed','document_viewed','block_viewed') order by e.created_at desc limit 12) e)

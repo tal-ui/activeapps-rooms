@@ -31,7 +31,7 @@ create policy room_settings_internal_all on public.room_settings
 insert into public.room_settings (key, value, description) values
   ('app_url', 'https://rooms.activeapps.io', 'Public URL of the Rooms app (links in e-mails and Slack)'),
   ('functions_url', '', 'Base URL of Edge Functions, e.g. https://<ref>.supabase.co/functions/v1 — empty disables the event webhook'),
-  ('functions_key', '', 'Publishable anon key sent as Bearer to Edge Functions (functions verify the JWT)'),
+  ('functions_key', '', 'LEGACY anon key (a JWT, eyJ…) sent as Bearer to Edge Functions — the new sb_publishable_ key is not a JWT and would be rejected by verify_jwt'),
   ('crm_stage_on_agreed', 'negotiation', 'opportunities.stage to set when an engagement is agreed'),
   ('crm_stage_on_signed', 'closed_won', 'opportunities.stage to set when an engagement is signed'),
   ('slack_channel_key', 'rooms', 'integrations.slack config.channels key used for room notifications')
