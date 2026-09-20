@@ -6,3 +6,5 @@ dist
 *.log
 .vercel
 supabase/.temp
+.claude/*
+!.claude/launch.json
